@@ -1,17 +1,35 @@
+'''
+This script converts a quantized model from AutoGPTQ format to Marlin format.
+'''
 import torch
 from safetensors.torch import load_file, save_file
-import os, glob, shutil
+import os
 import re
-from typing import List
 import argparse
 import numpy as np
-from transformers import AutoConfig
+import json
+from tqdm import tqdm
 
-parser = argparse.ArgumentParser()
+BASE_MODEL_FILES = [
+    "added_tokens.json",
+    "config.json",
+    "configuration.json",
+    "configuration_minicpm.py",
+    "generation_config.json",
+    "model.safetensors",
+    "modeling_minicpm.py",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json"
+]
 
-parser.add_argument("--model-path", type=str, required=True, help="Path to the original model")
-parser.add_argument("--quant-path", type=str, required=True, help="Path to the AutoGPTQ model")
-parser.add_argument("--output-path", type=str, required=True, help="Path to save the converted model")
+EAGLE_MODEL_FILES = [
+    "model.safetensors",
+    "config.json"
+]
+
+EAGLE_SPECIFIC_WEIGHTS = ["fc.qweight", "fc.scales", "input_norm1.weight", "input_norm2.weight"]
 
 # Copied from https://github.com/AutoGPTQ/AutoGPTQ/blob/9f7d37072917ab3a7545835f23e808294a542153/auto_gptq/nn_modules/qlinear/qlinear_marlin.py
 def get_perms():
@@ -43,6 +61,40 @@ def get_perms():
     return perm, scale_perm, scale_perm_single
 
 PERM, SCALE_PERM, SCALE_PERM_SINGLE = get_perms()
+
+def check_file_integrity(gptq_path: str) -> bool:
+    files = os.listdir(gptq_path)
+
+    assert "model.safetensors" in files, f"model.safetensors not found in {gptq_path}"
+    ckpt = load_file(os.path.join(gptq_path, "model.safetensors"))
+
+    is_eagle = True
+    for eagle_specific_weight in EAGLE_SPECIFIC_WEIGHTS:
+        is_eagle &= eagle_specific_weight in ckpt.keys()
+
+    files_to_check = EAGLE_MODEL_FILES if is_eagle else BASE_MODEL_FILES
+    for file in files_to_check:
+        assert file in files, f"File {file} not found in {gptq_path}"
+
+    return ckpt, is_eagle
+
+def check_quant_config(gptq_path: str) -> dict:
+    config_json = os.path.join(gptq_path, "config.json")
+    with open(config_json, "r") as f:
+        config = json.load(f)
+    
+    assert "quantization_config" in config, "quantization config is not found in config.json"
+    quant_config = config["quantization_config"]
+
+    assert quant_config["bits"] == 4, "Only 4-bit quantization is supported for marlin"
+    assert quant_config["checkpoint_format"] == "gptq", "checkpoint format must be gptq"
+    assert quant_config["desc_act"] == False, "desc_act must be False"
+    assert quant_config["group_size"] == 128, "Only group size 128 is supported for marlin"
+    assert quant_config["lm_head"] == False, "quantized lm_head is not supported"
+    assert quant_config["static_groups"] == True, "static_groups must be True"
+    assert quant_config["sym"] == True, "Only symmetric quantization is supported"
+
+    return config
 
 def marlin_permute_scales(s: torch.Tensor, size_k: int, size_n: int, group_size: int) -> torch.Tensor:
 
@@ -81,19 +133,11 @@ def marlin_repack_qweight(qweight: torch.Tensor, bits: int, size_k: int, size_n:
 
     return repacked_qweight
 
-def convert_w4a16_checkpoint(orig_model_path, quant_path, output_path):
+def gptq_to_marlin(autogptq_weigths: dict, is_eagle: bool, config: dict) -> dict:
 
-    config = AutoConfig.from_pretrained(quant_path)
-    
-    group_size = config.quantization_config['group_size']
-    assert group_size in [-1, 128], "Only group_size -1 and 128 are supported for marlin"
-
-    bits = config.quantization_config['bits']
-    assert bits == 4, "Only 4-bit quantization is supported for marlin"
-    
-    model_path = glob.glob(os.path.join(quant_path, "*.safetensors"))[0]
-
-    autogptq_weigths = load_file(model_path)
+    bits = config["quantization_config"]["bits"]
+    group_size = config["quantization_config"]["group_size"]
+    num_hidden_layers = config["num_hidden_layers"]
 
     gptq_convert_dict = {
         "model.layers.{}.self_attn.q_proj.qweight": ["model.layers.{}.self_attn.q_proj.scales", "model.layers.{}.self_attn.q_proj.g_idx", "model.layers.{}.self_attn.q_proj.qzeros"], 
@@ -102,14 +146,14 @@ def convert_w4a16_checkpoint(orig_model_path, quant_path, output_path):
         "model.layers.{}.self_attn.o_proj.qweight":["model.layers.{}.self_attn.o_proj.scales", "model.layers.{}.self_attn.o_proj.g_idx", "model.layers.{}.self_attn.o_proj.qzeros"],
         "model.layers.{}.mlp.gate_proj.qweight":["model.layers.{}.mlp.gate_proj.scales", "model.layers.{}.mlp.gate_proj.g_idx", "model.layers.{}.mlp.gate_proj.qzeros"],
         "model.layers.{}.mlp.up_proj.qweight": ["model.layers.{}.mlp.up_proj.scales", "model.layers.{}.mlp.up_proj.g_idx", "model.layers.{}.mlp.up_proj.qzeros"],
-        "model.layers.{}.mlp.down_proj.qweight": ["model.layers.{}.mlp.down_proj.scales", "model.layers.{}.mlp.down_proj.g_idx", "model.layers.{}.mlp.down_proj.qzeros"],
-        "fc.qweight": ["fc.scales", "fc.g_idx", "fc.qzeros"],
+        "model.layers.{}.mlp.down_proj.qweight": ["model.layers.{}.mlp.down_proj.scales", "model.layers.{}.mlp.down_proj.g_idx", "model.layers.{}.mlp.down_proj.qzeros"]
     }
 
     convert_checkpoint = {}
     processed_keys = set()
+    processed_layers = set()
 
-    for gptq_key in autogptq_weigths:
+    for gptq_key in tqdm(autogptq_weigths):
         if gptq_key in processed_keys:
             continue
         elif "layers" in gptq_key:
@@ -153,6 +197,7 @@ def convert_w4a16_checkpoint(orig_model_path, quant_path, output_path):
                         processed_keys.add(q_keys.format(layer_num))
                         processed_keys.add(q_keys.replace("q_proj", "k_proj").format(layer_num))
                         processed_keys.add(q_keys.replace("q_proj", "v_proj").format(layer_num))
+            
             elif "gate_proj" in abstract_key:
                 if abstract_key.endswith('qweight'):
                     up_key = gptq_key.replace('gate_proj', 'up_proj')
@@ -213,75 +258,70 @@ def convert_w4a16_checkpoint(orig_model_path, quant_path, output_path):
 
             elif "post_attention_layernorm" in gptq_key or "input_layernorm" in gptq_key:
                 convert_checkpoint[gptq_key] = autogptq_weigths[gptq_key].clone()
-        elif "fc" in gptq_key and autogptq_weigths[gptq_key].dtype == torch.int32:
-            if gptq_key.endswith('qweight'):
-                fc_qweight = autogptq_weigths[gptq_key].clone().cuda()
-                packed_in_features_x_2, out_features = fc_qweight.shape
-                packed_in_features = packed_in_features_x_2 // 2
-                in_features = packed_in_features * 32 // bits
-                fc1_weight = fc_qweight[:packed_in_features, :].contiguous()
-                fc2_weight = fc_qweight[packed_in_features:, :].contiguous()
-
-                fc1_weight = marlin_repack_qweight(fc1_weight, bits, in_features, out_features)
-                fc2_weight = marlin_repack_qweight(fc2_weight, bits, in_features, out_features)
-
-                convert_checkpoint[gptq_key] = torch.cat([fc1_weight, fc2_weight], dim=-1).cpu()
-                processed_keys.add(gptq_key)
-
-                for fc_key in gptq_convert_dict[gptq_key]:
-                    if fc_key.endswith("scales"):
-                        fc_scales = autogptq_weigths[gptq_key.replace("qweight", "scales")].clone().cuda()
-                        fc_scales_1 = fc_scales[:in_features // group_size, :].contiguous()
-                        fc_scales_2 = fc_scales[in_features // group_size:, :].contiguous()
-
-                        fc_scales_1 = marlin_permute_scales(
-                            fc_scales_1.data.contiguous(), 
-                            size_k=in_features,
-                            size_n=out_features,
-                            group_size=group_size
-                        )
-                        fc_scales_2 = marlin_permute_scales(
-                            fc_scales_2.data.contiguous(), 
-                            size_k=in_features,
-                            size_n=out_features,
-                            group_size=group_size
-                        )
-                        # convert_checkpoint[q_keys.format(layer_num).replace("gate_proj", "gate_up_proj")] = scales_x.cpu()
-                        convert_checkpoint[gptq_key.replace("qweight", "scales")] = torch.cat([fc_scales_1, fc_scales_2], dim=-1).cpu()
-                        processed_keys.add(gptq_key.replace("qweight", "scales"))
+            
+            processed_layers.add(int(layer_num))
         else:  
             convert_checkpoint[gptq_key] = autogptq_weigths[gptq_key].clone()
 
-    save_file(convert_checkpoint, os.path.join(output_path, f"model_gptq.safetensors"))
-    # copy quantization config
-    config_list = glob.glob(os.path.join(quant_path, "*config.json"))
-    for config_file in config_list:
-        # copy config to output path
-        config_filename = os.path.basename(config_file)
-        dst_path = os.path.join(output_path, config_filename)
-        shutil.copy2(config_file, dst_path)
-    
-    # copy tokenizer
-    tokenizer_list = glob.glob(os.path.join(orig_model_path, "tokenizer*"))
-    for tokenizer_file in tokenizer_list:
-        # copy config to output path
-        tokenizer_filename = os.path.basename(tokenizer_file)
-        dst_path = os.path.join(output_path, tokenizer_filename)
-        shutil.copy2(tokenizer_file, dst_path)
-    
-    # copy "special_tokens_map.json"
-    special_tokens_map_file = glob.glob(os.path.join(orig_model_path, "special_tokens_map.json"))[0]
-    special_tokens_map_basename = os.path.basename(special_tokens_map_file)
-    dst_path = os.path.join(output_path, special_tokens_map_basename)
-    shutil.copy2(special_tokens_map_file, dst_path)
-    
-if __name__=="__main__":
-    
+    assert len(processed_layers) == num_hidden_layers, "number of processed layers is not equal to num_hidden_layers"
+
+    if is_eagle:
+        eagle_convert_checkpoint = {}
+        eagle_convert_checkpoint["embed_tokens.weight"] = convert_checkpoint["model.embed_tokens.weight"].to(torch.float16)
+
+        fc_qweight = convert_checkpoint["fc.qweight"].clone().cuda()
+        assert fc_qweight.dtype == torch.int32, "fc.qweight must be int32"
+        packed_in_features_x_2, out_features = fc_qweight.shape
+        packed_in_features = packed_in_features_x_2 // 2
+        in_features = packed_in_features * 32 // bits
+        fc1_weight = fc_qweight[:packed_in_features, :].contiguous()
+        fc2_weight = fc_qweight[packed_in_features:, :].contiguous()
+        fc1_weight = marlin_repack_qweight(fc1_weight, bits, in_features, out_features)
+        fc2_weight = marlin_repack_qweight(fc2_weight, bits, in_features, out_features)
+        eagle_convert_checkpoint["fc.qweight"] = torch.cat([fc1_weight, fc2_weight], dim=-1).cpu()
+
+        fc_scales = convert_checkpoint["fc.scales"].clone().cuda()
+        fc_scales_1 = fc_scales[:in_features // group_size, :].contiguous()
+        fc_scales_2 = fc_scales[in_features // group_size:, :].contiguous()
+        fc_scales_1 = marlin_permute_scales(fc_scales_1.data.contiguous(), size_k=in_features, size_n=out_features, group_size=group_size)
+        fc_scales_2 = marlin_permute_scales(fc_scales_2.data.contiguous(), size_k=in_features, size_n=out_features, group_size=group_size)
+        eagle_convert_checkpoint["fc.scales"] = torch.cat([fc_scales_1, fc_scales_2], dim=-1).cpu()
+
+        eagle_convert_checkpoint["input_norm1.weight"] = convert_checkpoint["input_norm1.weight"].to(torch.float16)
+        eagle_convert_checkpoint["input_norm2.weight"] = convert_checkpoint["input_norm2.weight"].to(torch.float16)
+
+        for key, value in convert_checkpoint.items():
+            if "model.layers." in key:
+                new_key = key.replace("model.", "")
+                eagle_convert_checkpoint[new_key] = value
+
+        return eagle_convert_checkpoint
+    else:
+        return convert_checkpoint
+
+def save_marlin_model(gptq_path: str, marlin_path: str, convert_checkpoint: dict, is_eagle: bool):
+    os.makedirs(marlin_path, exist_ok=True)
+
+    save_file(convert_checkpoint, os.path.join(marlin_path, "model_gptq.safetensors"))
+
+    files_to_copy = EAGLE_MODEL_FILES if is_eagle else BASE_MODEL_FILES
+    files_to_copy.remove("model.safetensors")
+
+    for file in files_to_copy:
+        src_file = os.path.join(gptq_path, file)
+        os.system(f"cp {src_file} {marlin_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--src", type=str, required=True, help="Path to AutoGPTQ model")
+    parser.add_argument("--dst", type=str, required=True, help="Path to Marlin model")
+
     args = parser.parse_args()
-    orig_model_path = args.model_path
-    quant_path = args.quant_path
-    output_path = args.output_path
+    gptq_path = args.src
+    marlin_path = args.dst
 
-    os.makedirs(output_path, exist_ok=True)
+    checkpoint, is_eagle = check_file_integrity(gptq_path)
+    config = check_quant_config(gptq_path)
 
-    convert_w4a16_checkpoint(orig_model_path, quant_path, output_path)
+    convert_checkpoint = gptq_to_marlin(checkpoint, is_eagle, config)
+    save_marlin_model(gptq_path, marlin_path, convert_checkpoint, is_eagle)

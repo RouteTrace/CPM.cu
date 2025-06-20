@@ -12,6 +12,7 @@ class fwdIterator{
         this->n_block_max = n_block_max;
         this->batch_idx = batch_idx;  // Store batch_idx for debugging
         this->head_idx = head_idx;
+        this->blocks_per_bitmap_bit = params.algorithm_block_size / kBlockN;  // 64/32 = 2
 
         const int q_block_idx = loop_step_idx + cache_seqlen_k;
         if (params.blockmask != nullptr) {
@@ -52,7 +53,7 @@ class fwdIterator{
         target = min(target, max_block_idx - 1);
         
         // 计算相对于当前q_bit_position的实际位置
-        int target_bit_pos = target;
+        int target_bit_pos = target / blocks_per_bitmap_bit;
         
         // 确定此块在哪个uint64中
         int uint64_offset = target_bit_pos / 64;
@@ -70,8 +71,10 @@ class fwdIterator{
         if (value != 0) {
             // 找到最高位的1（即不大于target的最大设置位）
             int highest_bit = 63 - __clzll(value);  // __clzll计算前导0的数量
-            int result = highest_bit + (uint64_offset * 64);
-            return result;
+            int bitmap_idx = highest_bit + (uint64_offset * 64);
+            // cuda block idx N
+            int max_available_operator_block = (bitmap_idx + 1) * blocks_per_bitmap_bit - 1;
+            return min(max_available_operator_block, target);
         }
         
         // 如果当前uint64中没有找到，检查更低的uint64块
@@ -80,9 +83,8 @@ class fwdIterator{
             if (value != 0) {
                 // 找到最高位的1
                 int highest_bit = 63 - __clzll(value);
-                // 计算相对于q_bit_position的偏移
-                int result = highest_bit + (i * 64);
-                return result;
+                int bitmap_idx = highest_bit + (i * 64);
+                return (bitmap_idx + 1) * blocks_per_bitmap_bit - 1;
             }
         }
         
@@ -103,6 +105,7 @@ class fwdIterator{
     int n_block_min, n_block_max;
     int batch_idx, head_idx;
     int k_window_left;
+    int blocks_per_bitmap_bit;   // 每个bitmap位对应的算子block数量
 };
 
 }  // namespace flash

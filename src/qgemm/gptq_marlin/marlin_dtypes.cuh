@@ -1,5 +1,6 @@
 
-#define _data_types_cuh
+#ifndef _DATA_TYPES_CUH
+#define _DATA_TYPES_CUH
 #include "marlin.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -73,3 +74,4 @@ class ScalarType<nv_bfloat16> {
 
 }  // namespace marlin
 
+#endif  // _DATA_TYPES_CUH

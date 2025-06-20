@@ -213,7 +213,7 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
         }
     } else {
         constexpr static int kBlockM = 16;
-        constexpr static int kBlockN = 64;
+        constexpr static int kBlockN = 32;
         run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 1, false, false, T>, Is_causal>(params, stream);
     }
 }

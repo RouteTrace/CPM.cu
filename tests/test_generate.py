@@ -9,49 +9,51 @@ import numpy as np
 import argparse
 import sys
 import os
+import json
 from huggingface_hub import snapshot_download   
 
-# Default Configuration
-default_config = {
-    'test_minicpm4': True,
-    'use_stream': True,
-    'apply_eagle': True,
-    'apply_quant': True,
-    'apply_sparse': True,
-    'apply_eagle_quant': True,
-    "minicpm4_yarn": True, # TODO default is True for long context test, better implementation
-    'frspec_vocab_size': 32768,
-    'eagle_window_size': 8 * 128,
-    'eagle_num_iter': 2,
-    'eagle_topk_per_iter': 10,
-    'eagle_tree_size': 12,
-    'apply_compress_lse': True,
-    'sink_window_size': 1,
-    'block_window_size': 8,
-    'sparse_topk_k': 64,
-    "sparse_switch": 1,
-    'num_generate': 256,
-    'chunk_length': 2048,
-    'memory_limit': 0.9,
-    'cuda_graph': True,
-    'dtype': torch.float16,
-    'use_terminators': True,
-    "temperature": 0.0,
-    "random_seed": None,
-}
+def load_config_from_file(config_path: str) -> dict:
+    """Load configuration from JSON file"""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    
+    # Convert dtype string to torch dtype
+    if 'dtype' in config:
+        if config['dtype'] == 'float16':
+            config['dtype'] = torch.float16
+        elif config['dtype'] == 'bfloat16':
+            config['dtype'] = torch.bfloat16
+    
+    return config
 
-# Demo Configuration: Only for MiniCPM4 demo, will be deleted after release
-demo_config = {
-    'use_enter': False,
-    'use_decode_enter': False,
-}
-
-# Combined Default Configurations
-default_config = {**default_config, **demo_config}
+def get_default_config():
+    """Get default configuration from file"""
+    default_config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'default_config.json')
+    
+    if not os.path.exists(default_config_path):
+        print(f"Error: Default config file not found at {default_config_path}")
+        print("Please ensure the config/default_config.json file exists.")
+        sys.exit(1)
+    
+    try:
+        return load_config_from_file(default_config_path)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing default config file {default_config_path}: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading default config file {default_config_path}: {e}")
+        sys.exit(1)
 
 def create_argument_parser():
     """Create and configure argument parser"""
     parser = argparse.ArgumentParser(description='Generate text using LLM models')
+    
+    # Configuration file argument
+    parser.add_argument('--config-file', '--config_file', type=str, default=None,
+                        help='Path to configuration file (JSON format, default: use default_config.json)')
     
     # Basic arguments
     parser.add_argument('--path-prefix', '--path_prefix', '-p', type=str, default='openbmb', 
@@ -155,8 +157,23 @@ def parse_and_merge_config(default_config):
     parser = create_argument_parser()
     args = parser.parse_args()
     
+    # Load configuration from file if specified
+    if args.config_file:
+        try:
+            config = load_config_from_file(args.config_file)
+            print(f"Loaded configuration from: {args.config_file}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing config file {args.config_file}: {e}")
+            sys.exit(1)
+    else:
+        config = default_config.copy()
+        print("Using default configuration")
+    
     # Set default values to None for boolean arguments that weren't specified
-    bool_args = [key for key, value in default_config.items() if isinstance(value, bool)]
+    bool_args = [key for key, value in config.items() if isinstance(value, bool)]
     for arg in bool_args:
         # Convert underscores to hyphens for command line argument names
         arg_hyphen = arg.replace('_', '-')
@@ -166,11 +183,8 @@ def parse_and_merge_config(default_config):
         if not arg_specified:
             setattr(args, arg, None)
 
-    # Override default config with command line arguments
-    config = default_config.copy()
-
     # Define parameter mappings for automatic override (exclude dtype which needs special handling)
-    auto_override_params = [key for key in default_config.keys() if key != 'dtype']
+    auto_override_params = [key for key in config.keys() if key != 'dtype']
 
     # Override config values if arguments are provided
     for param in auto_override_params:
@@ -535,5 +549,5 @@ def main(args, config):
     llm.print_perf_summary()
 
 if __name__ == "__main__":
-    args, config = parse_and_merge_config(default_config)
+    args, config = parse_and_merge_config(get_default_config())
     main(args, config)

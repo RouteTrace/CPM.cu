@@ -78,6 +78,9 @@ struct Flash_fwd_params : public Qkv_params {
     int m_block_dim, n_block_dim;
     int num_blocks_m, num_blocks_n;
     int block_window_size;
+    
+    // 算法层面的block大小 - 用于bitmap/pooling等算法逻辑
+    int algorithm_block_size;  // 默认64，控制bitmap粒度和算法语义
 
     // The mask_2d matrix.
     uint64_t *__restrict__ mask_2d;

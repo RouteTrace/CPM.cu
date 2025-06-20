@@ -37,6 +37,7 @@ https://github.com/user-attachments/assets/ab36fd7a-485b-4707-b72f-b80b5c43d024
 - [Installation](#install)
 - [Model Weights](#modelweights)
 - [Quick Start](#example)
+- [OpenAI API Server](#openai-api)
 
 <div id="install"></div>
 
@@ -44,11 +45,15 @@ https://github.com/user-attachments/assets/ab36fd7a-485b-4707-b72f-b80b5c43d024
 
 ### Install from source
 
+This library's build depends on torch and ninja. Please install both before installing this library.
+
 ```bash
 git clone https://github.com/OpenBMB/CPM.cu.git --recursive
 cd CPM.cu
-python3 setup.py install
+pip install .
 ```
+
+If you encounter installation issues, please follow the error messages to resolve them or create a GitHub issue. You can use `python setup.py --help-config` to view more installation configuration options.
 
 <div id="modelweights"></div>
 
@@ -68,8 +73,6 @@ python3 tests/test_generate.py --prompt-file <your prompt file>
 
 If you don't ​​specify​​ the model path, the scripts will load the model from ​​OpenBMB's Hugging Face repository​​.
 If you want to use local paths, we recommend keeping all model filenames unchanged and placing them in the same directory. This way, you can run the model by specifying the directory with the -p parameter. Otherwise, we suggest modifying the paths in the code accordingly.
-
-If you don't ​​specify​​ the prompt file, a default ​​Haystack task​​ with ​​15K context length​​ will be provided.
 You can use --help to learn more ​​about the script's features​​.
 
 We also provide a script, `tests/long_prompt_gen.py`, to generate ​​long code summarization.
@@ -105,6 +108,24 @@ Where:
 - the `Prefill` and `Decode` speed are output by (length, time and token/s).
 - the `Mean accept length` is the average length of the accepted tokens when using Speculative Sampling.
 
+<div id="openai-api"></div>
+
+## OpenAI API Server
+
+Start the OpenAI-compatible API server (same args as `tests/test_generate.py`):
+
+```bash
+python -m cpmcu.server [options]
+```
+
+Test the API (supports streaming and non-streaming modes):
+
+```bash
+python tests/test_openai_api.py [--no-stream]
+```
+
+Only `/v1/chat/completions` is supported and the `model` field is ignored.
+
 ## Code Structure
 
 ```bash
@@ -122,12 +143,22 @@ CPM.cu/
 ```
 
 ## More
+
+### Word Frequency File Generation
 We provide a word frequency generation script for FR-Spec, located at "scripts/fr_spec/gen_fr_index.py". You can run it as follows:
-```
+```bash
 python scripts/fr_spec/gen_fr_index.py --model_path <your_model_path>
 ```
 You can modify the code to use your own dataset. If your task is in a specific vertical domain, constructing word frequencies tailored to that domain can significantly improve processing speed.
 
+### GPTQ to Marlin Conversion
+We provide a script to convert GPTQ-quantized model to Marlin format, located at "scripts/model_convert/gptq2marlin.py". You can run it as follows:
+```bash
+python scripts/model_convert/gptq2marlin.py \
+    --src <gptq_model_path> \
+    --dst <marlin_model_path>
+```
+This script supports MiniCPM, Llama and EAGLE format. It will automatically detect the model type and perform the appropriate conversion.
 
 ## Acknowledgments
 
@@ -164,4 +195,3 @@ Please cite our paper if you find our work valuable.
   author={MiniCPM},
   year={2025}
 }
-```

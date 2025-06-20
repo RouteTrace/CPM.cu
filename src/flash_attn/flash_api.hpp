@@ -126,6 +126,8 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.unpadded_lse = unpadded_lse;
     params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
+    
+    params.algorithm_block_size = 64;  // algorithm block size
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
